@@ -1,7 +1,4 @@
-/* A TCP echo server.
- *
- * Receive a message on port 32000, turn it into upper case and return
- * it to the sender.
+/* A simple HTTP server based on a TCP server by Marcel Kyas
  *
  * Copyright (c) 2016, Marcel Kyas
  * All rights reserved.
@@ -31,8 +28,10 @@
  * OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+ #include <errno.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -43,8 +42,9 @@
 #include <glib.h>
 #include <glib/gprintf.h>
 
+#define HTTP_PORT 61284
 #define MESSAGE_SIZE 1024
-#define RESPONSE_SIZE 2048
+#define TIMEOUT 5
 
 typedef struct {
 	struct http_request {
@@ -57,10 +57,7 @@ typedef struct {
 		gchar * code;
 		gchar * phrase;
 	} status;
-	struct http_header {
-		gchar * name;
-		gchar * value;
-	} * headers;
+	GHashTable * headers;
 	gchar * body;
 } http_message;
 
@@ -72,7 +69,7 @@ int main()
 {
     int sockfd;
     struct sockaddr_in server, client;
-    char message[MESSAGE_SIZE];
+    char message[MESSAGE_SIZE] = {0};
 
     // Create and bind a TCP socket.
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -82,41 +79,71 @@ int main()
     memset(&server, 0, sizeof(server));
     server.sin_family = AF_INET;
     server.sin_addr.s_addr = htonl(INADDR_ANY);
-    server.sin_port = htons(61284);
+    server.sin_port = htons(HTTP_PORT);
     bind(sockfd, (struct sockaddr *) &server, (socklen_t) sizeof(server));
  
     // Before the server can accept messages, it has to listen to the
     // welcome port. A backlog of one connection is allowed.
     listen(sockfd, 1);
-
+	
+	int connfd = 0;
+	
     for (;;) {
+		
         // We first have to accept a TCP connection, connfd is a fresh
-        // handle dedicated to this connection.
-        socklen_t len = (socklen_t) sizeof(client);
-        int connfd = accept(sockfd, (struct sockaddr *) &client, &len);
+		// handle dedicated to this connection.
+		socklen_t len = (socklen_t) sizeof(client);
 
+		//Don't wait for new connections until the last one has closed
+		if(connfd == 0)
+		{
+			connfd = accept(sockfd, (struct sockaddr *) &client, &len);
+			// Receives should timeout after a given number of seconds.
+			struct timeval timeout;
+			timeout.tv_sec = TIMEOUT;
+			timeout.tv_usec = 0;
+			setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+		}			
+		
         // Receive from connfd, not sockfd.
         ssize_t n = recv(connfd, message, sizeof(message) - 1, 0);
+		
+		if(n >= 0) 
+		{
+			message[n] = '\0';
+			g_fprintf(stdout, "Message received:\n%s", message);
+			http_message request = parseRequest(message);
 
-        message[n] = '\0';
-        fprintf(stdout, "Received:\n%s\n\n", message);
+			gchar * response = generateResponse(request, client);
+			size_t size = strlen(response);
+			send(connfd, response, size, 0);
+			g_free(response);
 
-		http_message request = parseRequest(message);
-		//printMessage(request);
-		gchar * response = generateResponse(request, client);
-		size_t size = strlen(response);
-		send(connfd, response, size, 0);
-		g_free(response);
+			if(g_strcmp0(g_hash_table_lookup(request.headers, "Connection:"), "close") == 0)
+			{
+				g_fprintf(stdout, "Closing connection\n");
+				shutdown(connfd, SHUT_RDWR);
+				connfd = close(connfd);
+			}
 
-        // Close the connection.
-        shutdown(connfd, SHUT_RDWR);
-        close(connfd);
+		}
+		
+        else if(errno == EAGAIN || errno == EWOULDBLOCK)
+		{
+			g_fprintf(stdout, "Timeout: Closing connection\n");
+			shutdown(connfd, SHUT_RDWR);
+			connfd = close(connfd);
+		}
+        
+		if(connfd < 0) perror("close()");
     }
 }
 
 http_message parseRequest(gchar * m) 
 {
+	//Separate the lines of the message
 	gchar ** message = g_strsplit(m, "\r\n", -1);
+	
 	//Parse the request line
 	gchar ** request_line = g_strsplit(message[0], " ", 3);
 	struct http_request request = { 
@@ -127,19 +154,21 @@ http_message parseRequest(gchar * m)
 	g_strfreev(request_line);
 
 	//Parse headers if exist
-	struct http_header * headers = NULL;
-	guint i;
-
+	GHashTable * headers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	guint i = 1;
 	for(i = 1; strlen(message[i]) > 1; i++)
 	{
-		headers = (struct http_header *) realloc(headers, (i) * sizeof(struct http_header));
 		gchar ** header_line = g_strsplit(message[i], " ", 2);
-		struct http_header header = {
-			.name = g_strdup(header_line[0]),
-			.value = g_strdup(header_line[1])
-		};
+		g_hash_table_insert(headers, g_strdup(header_line[0]), g_strdup(header_line[1]));
 		g_strfreev(header_line);
-		headers[i-1] = header;
+	}
+	
+	//Add a connection header if not there, depending on version
+	if(g_hash_table_lookup(headers, "Connection:") == NULL)
+	{
+		gchar * connection = g_strcmp0(request.version, "HTTP/1.0") ? "keep-alive" : "close";
+		g_hash_table_insert(headers, "Connection:", connection);
+		g_fprintf(stdout, "Connection set to: %s\n", connection);
 	}
 
 	//Add body if available, will otherwise be null
@@ -162,7 +191,7 @@ gchar * generateResponse(http_message m, struct sockaddr_in client)
 		body = g_strdup_printf("%s %s:%d", m.request.URL, inet_ntoa(client.sin_addr), (int) ntohs(client.sin_port));
 	}
 	gchar * content = g_strdup_printf("<!DOCTYPE HTML>\n<html>\n<body>\n%s\n</body>\n</html>", body);
-	gchar * headers = g_strdup_printf("Connection: close\r\nContent-Length: %d", (int) strlen(content));
+	gchar * headers = g_strdup_printf("Connection: %s\r\nContent-Length: %d", (gchar*) g_hash_table_lookup(m.headers, "Connection:"), (int) strlen(content));
 	
 	gchar * response = NULL;
 	if(g_strcmp0(m.request.method, "GET") == 0)  response = g_strjoin("\r\n", status, headers, "", content, NULL);
@@ -177,41 +206,21 @@ gchar * generateResponse(http_message m, struct sockaddr_in client)
 
 	return response;
 }
-
+/*
 void printMessage(http_message m)
 {
 	g_fprintf(stdout, "HTTP message:\n");
 	g_fprintf(stdout, "Request line: %s %s %s\r\n", m.request.method, m.request.URL, m.request.version);
-	struct http_header * current_header = m.headers;
-	while(current_header->name != NULL)
+	
+	GHashTableIter iter;
+	gchar * key, value;
+	g_hash_table_iter_init(&iter, m.headers);
+	while(g_hash_table_iter_next(&iter, key, value))
 	{
-		g_fprintf(stdout, "Header line: %s %s\r\n", current_header->name, current_header->value);
-		current_header++;
+		g_fprintf(stdout, "%s %s\r\n", key, value);
 	}
 	
 	g_fprintf(stdout, "Body content:\n%s\n", m.body);
 	puts("---END OF MESSAGE---");
-}
-
-/*
-http_message generateResponse(http_message m, struct sockaddr_in client)
-{
-	struct http_status status = {
-		.version = m.request.version,
-		.code = "200",
-		.phrase = "OK"
-	};
-	
-	gchar * content_length;
-	struct http_header headers[3] = {
-		(struct http_header) { .name = "Connection: ", .value = "close" },
-		(struct http_header) { .name = "Content-Length: ", .value = content_length },
-		(struct http_header) { .name = "Content-Type: ", .value = "text/html" }
-	};
-	
-	gchar * body = g_strconcat("<!DOCTYPE html>\n<html>\n<body>\n", m.request.URL, " ", inet_ntoa(client.sin_addr), "\n</body>\n</html>", NULL;
-	g_sprintf(content_length, "%d", strlen(inet_ntoa(client.sin_addr)));
-	
-	return (http_message) { .status = status, .headers = headers, .body = body};
 }
 */
